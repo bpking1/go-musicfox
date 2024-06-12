@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -93,14 +92,15 @@ func downloadMusic(url, musicType string, song structs.Song, downloadDir string)
 	filename := filenameBuilder.String()
 
 	// Windows Linux 均不允许文件名中出现 / \ 替换为 _
-	filename = strings.ReplaceAll(filename, "/", "_")
-	filename = strings.ReplaceAll(filename, "\\", "_")
+	replacer := strings.NewReplacer("/", "_", "\\", "_", "*", "_")
+	filename = replacer.Replace(filename)
 	err := DownloadFile(url, filename, downloadDir)
 	if err != nil {
 		return err
 	}
 	file, _ := os.OpenFile(filepath.Join(downloadDir, filename), os.O_RDWR, os.ModePerm)
 	SetSongTag(file, song)
+	slog.Info("下载歌曲成功", slog.String("file", filename))
 	return nil
 }
 
@@ -113,7 +113,7 @@ func DownloadMusic(song structs.Song) {
 		err error
 	)
 
-	url, musicType, err := PlayableUrlSong(song)
+	url, musicType, err := PlayableURLSong(song)
 	if err != nil {
 		errHandler(err)
 		return
@@ -127,7 +127,7 @@ func DownloadMusic(song structs.Song) {
 		GroupId: types.GroupID,
 	})
 
-	if _, ok := getCacheUri(song.Id); ok {
+	if fpath := tryFindCache(song.Id); fpath != "" {
 		err = CopyCachedSong(song)
 	} else {
 		err = downloadMusic(url, musicType, song, downloadDir)
@@ -192,18 +192,6 @@ func CacheMusic(song structs.Song, url string, musicType string, quality service
 	}
 	SetSongTag(file, song)
 	slog.Info("缓存歌曲成功", slog.String("file", filename))
-}
-
-func GetCacheUrl(songId int64) (url, musicType string, ok bool) {
-	url, ok = getCacheUri(songId)
-	if !ok || path.Base(url) < fmt.Sprintf("%d-%d", songId, priority[configs.ConfigRegistry.Main.PlayerSongLevel]) {
-		ok = false
-		return
-	}
-	split := strings.Split(path.Base(url), ".")
-	musicType = split[len(split)-1]
-	ok = true
-	return
 }
 
 func ClearMusicCache() error {
@@ -275,7 +263,10 @@ func SetSongTag(file *os.File, song structs.Song) {
 				_ = metadata.(*songtag.FLAC).SetFlacPicture(img)
 			}
 		}
-		_ = metadata.SaveFile(file.Name() + "-tmp")
-		_ = os.Rename(file.Name()+"-tmp", file.Name())
+		filename := file.Name()
+		_ = metadata.SaveFile(filename + "-tmp")
+		_ = file.Close()
+		_ = os.Remove(filename)
+		_ = os.Rename(filename+"-tmp", filename)
 	}
 }
