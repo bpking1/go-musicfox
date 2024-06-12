@@ -36,50 +36,57 @@ func mpdErrorHandler(err error, ignore bool) {
 }
 
 type mpdPlayer struct {
-	bin        string
-	configFile string
-	network    string
-	address    string
+	conf *MpdConfig
 
 	watcher *mpd.Watcher
 	l       sync.Mutex
 
-	curMusic       UrlMusic
+	curMusic       URLMusic
 	curSongId      int
 	timer          *timex.Timer
-	latestPlayTime time.Time //避免切歌时产生的stop信号造成影响
+	latestPlayTime time.Time // 避免切歌时产生的stop信号造成影响
 
 	volume    int
 	state     types.State
 	timeChan  chan time.Duration
 	stateChan chan types.State
-	musicChan chan UrlMusic
+	musicChan chan URLMusic
 
 	close chan struct{}
 }
 
-func NewMpdPlayer(bin, configFile, network, address string) *mpdPlayer {
-	cmd := exec.Command(bin)
-	if configFile != "" {
-		cmd.Args = append(cmd.Args, configFile)
+type MpdConfig struct {
+	Bin        string
+	ConfigFile string
+	Network    string
+	Address    string
+	AutoStart  bool
+}
+
+func NewMpdPlayer(conf *MpdConfig) *mpdPlayer {
+	cmd := exec.Command(conf.Bin)
+	if conf.ConfigFile != "" {
+		cmd.Args = append(cmd.Args, conf.ConfigFile)
 	}
 
-	// 启动前kill
-	{
-		var killCmd = *cmd
-		killCmd.Args = append(killCmd.Args, "--kill")
-		output, err := killCmd.CombinedOutput()
+	if conf.AutoStart {
+		// 启动前kill
+		{
+			killCmd := *cmd
+			killCmd.Args = append(killCmd.Args, "--kill")
+			output, err := killCmd.CombinedOutput()
+			if err != nil {
+				slog.Warn("MPD kill失败", slogx.Error(err), slogx.Bytes("detail", output))
+			}
+		}
+
+		output, err := cmd.CombinedOutput()
 		if err != nil {
-			slog.Warn("MPD kill失败", slogx.Error(err), slogx.Bytes("detail", output))
+			panic(fmt.Sprintf("[ERROR] MPD启动失败:%s, 详情:\n%s", err, output))
 		}
 	}
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		panic(fmt.Sprintf("[ERROR] MPD启动失败:%s, 详情:\n%s", err, output))
-	}
-
-	client, err := mpd.Dial(network, address)
+	client, err := mpd.Dial(conf.Network, conf.Address)
 	mpdErrorHandler(err, false)
 
 	err = client.Clear()
@@ -91,20 +98,17 @@ func NewMpdPlayer(bin, configFile, network, address string) *mpdPlayer {
 	err = client.Repeat(false)
 	mpdErrorHandler(err, false)
 
-	watcher, err := mpd.NewWatcher(network, address, "", "player", "mixer")
+	watcher, err := mpd.NewWatcher(conf.Network, conf.Address, "", "player", "mixer")
 	mpdErrorHandler(err, false)
 
 	p := &mpdPlayer{
-		bin:        bin,
-		configFile: configFile,
-		network:    network,
-		address:    address,
-		watcher:    watcher,
-		state:      types.Stopped,
-		timeChan:   make(chan time.Duration),
-		stateChan:  make(chan types.State),
-		musicChan:  make(chan UrlMusic),
-		close:      make(chan struct{}),
+		conf:      conf,
+		watcher:   watcher,
+		state:     types.Stopped,
+		timeChan:  make(chan time.Duration),
+		stateChan: make(chan types.State),
+		musicChan: make(chan URLMusic),
+		close:     make(chan struct{}),
 	}
 
 	errorx.WaitGoStart(p.listen)
@@ -123,7 +127,7 @@ func (p *mpdPlayer) client() *mpd.Client {
 			return _client
 		}
 	}
-	_client, err = mpd.Dial(p.network, p.address)
+	_client, err = mpd.Dial(p.conf.Network, p.conf.Address)
 	mpdErrorHandler(err, false)
 	return _client
 }
@@ -170,9 +174,7 @@ func (p *mpdPlayer) syncMpdStatus(subsystem string) {
 
 // listen 开始监听
 func (p *mpdPlayer) listen() {
-	var (
-		err error
-	)
+	var err error
 
 	for {
 		select {
@@ -196,18 +198,14 @@ func (p *mpdPlayer) listen() {
 			}
 
 			var (
-				url     string
-				isCache bool
+				url     = p.curMusic.URL
+				isLocal = strings.HasPrefix(p.curMusic.URL, "file://")
 			)
-			if strings.HasPrefix(p.curMusic.Url, "http") {
-				url = p.curMusic.Url
-				isCache = false
-			} else {
-				url = path.Base(p.curMusic.Url)
-				isCache = true
+			if isLocal {
+				url = path.Base(p.curMusic.URL)
 			}
 
-			if isCache {
+			if isLocal {
 				_, err = p.client().Rescan(url)
 				mpdErrorHandler(err, false)
 				for {
@@ -244,7 +242,7 @@ func (p *mpdPlayer) listen() {
 
 			err = p.client().PlayID(p.curSongId)
 			mpdErrorHandler(err, false)
-			if !isCache {
+			if !isLocal {
 				// Doing this because github.com/fhs/gompd/v2/mpd hasn't implement "addtagid" yet
 				command := "addtagid %d %s %s"
 				err = p.client().Command(command, p.curSongId, "artist", p.curMusic.ArtistName()).OK()
@@ -280,7 +278,7 @@ func (p *mpdPlayer) setState(state types.State) {
 	}
 }
 
-func (p *mpdPlayer) Play(music UrlMusic) {
+func (p *mpdPlayer) Play(music URLMusic) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
@@ -289,7 +287,7 @@ func (p *mpdPlayer) Play(music UrlMusic) {
 	}
 }
 
-func (p *mpdPlayer) CurMusic() UrlMusic {
+func (p *mpdPlayer) CurMusic() URLMusic {
 	return p.curMusic
 }
 
@@ -416,10 +414,12 @@ func (p *mpdPlayer) Close() {
 	err = p.client().Close()
 	mpdErrorHandler(err, true)
 
-	cmd := exec.Command(p.bin)
-	if p.configFile != "" {
-		cmd.Args = append(cmd.Args, p.configFile)
+	if p.conf.AutoStart {
+		cmd := exec.Command(p.conf.Bin)
+		if p.conf.ConfigFile != "" {
+			cmd.Args = append(cmd.Args, p.conf.ConfigFile)
+		}
+		cmd.Args = append(cmd.Args, "--kill")
+		_ = cmd.Run()
 	}
-	cmd.Args = append(cmd.Args, "--kill")
-	_ = cmd.Run()
 }
